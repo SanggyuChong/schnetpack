@@ -104,7 +104,7 @@ class LLPredRigidtyAtomwise(nn.Module):
         """
         Args:
             orig_model: original `Atomwise` model that this class wraps
-            ll_feat_aggregation_mode: one of sum, avg, or None, defaults to 
+            ll_feat_aggregation_mode: one of sum, avg, or None, defaults to
                                       aggregation mode of original model
             save_ll_feat_per_atom: option to save the ll feats per atom
         """
@@ -129,6 +129,10 @@ class LLPredRigidtyAtomwise(nn.Module):
         if self.orig_model.per_atom_output_key is not None:
             inputs[self.orig_model.per_atom_output_key] = y
 
+        # accumulate the per-atom ll feats if necessary
+        if self.save_ll_feat_per_atom:
+            inputs["ll_feats_per_atom"] = ll_feats
+
         # aggregate predictions
         if self.orig_model.aggregation_mode is not None:
             idx_m = inputs[properties.idx_m]
@@ -147,7 +151,7 @@ class LLPredRigidtyAtomwise(nn.Module):
             if self.ll_feat_aggregation_mode == "avg":
                 ll_feats = ll_feats / inputs[properties.n_atoms]
 
-        inputs[self.output_key] = y
+        inputs[self.orig_model.output_key] = y
         inputs["ll_feats"] = ll_feats
         return inputs
 

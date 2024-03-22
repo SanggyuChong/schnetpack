@@ -5,9 +5,12 @@ from typing import Dict, Optional, List
 from schnetpack.transform import Transform
 import schnetpack.properties as properties
 from schnetpack.utils import as_dtype
+from schnetpack.atomistic import Atomwise, LLPredRigidtyAtomwise, Forces #, LLPredRigidityForces
 
 import torch
 import torch.nn as nn
+
+import copy
 
 __all__ = ["AtomisticModel", "NeuralNetworkPotential"]
 
@@ -186,3 +189,142 @@ class NeuralNetworkPotential(AtomisticModel):
         results = self.extract_outputs(inputs)
 
         return results
+
+
+class LLPredRigidityNNP(AtomisticModel):
+    """
+    A wrapper class for neural network potential that implements LLPR uncertainties.
+
+    """
+
+    def __init__(
+        self,
+        orig_model: NeuralNetworkPotential,
+        ll_feat_aggregation_mode: Optional[str] = None,
+        save_ll_feat_per_atom: bool = False,
+        consider_ll_feat_gradients: bool = False,
+    ):
+        """
+        Args:
+            orig_model: Original `NeuralNetworkPotential` model for which
+            wrapping is done.
+            ll_feat_aggregation_mode: one of sum, avg, or None, defaults to
+            aggregation mode of original model
+            save_ll_feat_per_atom: option to save the ll feats per atom
+            consider_ll_feat_gradients: option to also save gradients of ll
+            feats if used during training (e.g. forces, stresses)
+        """
+        super().__init__()
+        self.orig_model = copy.deepcopy(orig_model)
+        mod_output_modules = nn.ModuleList()
+
+        self.ll_feat_aggregation_mode = ll_feat_aggregation_mode
+        self.save_ll_feat_per_atom = save_ll_feat_per_atom
+        self.consider_ll_feat_gradients = consider_ll_feat_gradients
+
+        # Find and modify the output modules to extract the ll feats. Strictly
+        # assumes output modules are composed of one `Atomwise` and one `Forces`
+        # modules.
+
+        if len(self.orig_model.output_modules) > 2:
+            assert RuntimeError("Too many output modules for current implementation of LLPR!")
+
+        atomwise_detected = False
+        forces_detected = False
+        for module in self.orig_model.output_modules:
+            if isinstance(module, Atomwise):
+                if atomwise_detected:
+                    assert RuntimeError("LLPR is currently not compatible with "
+                                        "multiple `Atomwise` output modules!")
+                mod_output_modules.append(
+                    LLPredRigidtyAtomwise(
+                        module,
+                        self.ll_feat_aggregation_mode,
+                        self.save_ll_feat_per_atom,
+                    )
+                )
+                self.ll_feat_dim = module.outnet[-1].in_features
+                atomwise_detected = True
+            elif isinstance(module, Forces):
+                if forces_detected:
+                    assert RuntimeError("LLPR is currently not compatible with "
+                                        "multiple `Forces` output modules!")
+                # if self.consider_ll_feat_gradients:
+                #     mod_output_modules.append(LLPredRigidtyForces(module))
+                else:
+                    mod_output_modules.append(module)
+                forces_detected = True
+
+        self.output_modules = mod_output_modules
+        self.register_buffer(
+            "covariance",
+            torch.zeros((self.ll_feat_dim, self.ll_feat_dim),
+                        device=next(self.orig_model.parameters()).device)
+        )
+        self.register_buffer(
+            "inv_covariance",
+            torch.zeros((self.ll_feat_dim, self.ll_feat_dim),
+                        device=next(self.orig_model.parameters()).device)
+        )
+
+        self.covariance_computed = False
+        self.inv_covariance_computed = False
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # initialize derivatives for response properties
+        inputs = self.orig_model.initialize_derivatives(inputs)
+
+        for m in self.orig_model.input_modules:
+            inputs = m(inputs)
+
+        inputs = self.orig_model.representation(inputs)
+
+        # use modified output modules
+        for m in self.output_modules:
+            inputs = m(inputs)
+
+        # apply postprocessing (if enabled)
+        inputs = self.orig_model.postprocess(inputs)
+        results = self.orig_model.extract_outputs(inputs)
+
+        results.append(inputs["ll_feats"])
+
+        if self.consider_ll_feat_gradients:
+            if "ll_feat_grad_F" in inputs:
+                results.append(inputs["ll_feat_grad_F"])
+            if "ll_feat_grad_S" in inputs:
+                results.append(inputs["ll_feat_grad_S"])
+
+        if self.inv_covariance_computed:
+            uncertainty = torch.einsum("ij, jk, ik -> i",
+                                       inputs["ll_feats"],
+                                       self.inv_covariance,
+                                       inputs["ll_feats"],
+                                       )
+            results["uncertainty"] = uncertainty.unsqueeze(1)
+
+        return results
+
+    # def compute_covariance(self, dataset, weight_dict: List[float]) -> None:
+    #     # Utility function to compute the covariance matrix for a training set.
+    #     for cur_input in dataset:
+
+    #         batch.to(self.covariance.device)
+    #         batch_dict = batch.to_dict()
+
+    #         output = self.forward(cur_input)
+
+    #         ll_feats = output["ll_feats"].detach()
+    #         self.covariance = self.covariance + ll_feats.T @ ll_feats
+
+    #     self.covariance_computed = True
+
+    # def compute_inv_covariance(self, C: float, sigma: float) -> None:
+    #     # Utility function to set the hyperparameters of the uncertainty model.
+    #     if not self.covariance_computed:
+    #         raise RuntimeError("You must compute the covariance matrix before "
+    #                            "computing the inverse covariance matrix!")
+    #     self.inv_covariance = C * torch.linalg.inv(
+    #         self.covariance + sigma**2 * torch.eye(self.hidden_size_sum, device=self.covariance.device)
+    #         )
+    #     self.inv_covariance_computed = True
