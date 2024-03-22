@@ -8,7 +8,9 @@ import schnetpack as spk
 import schnetpack.nn as snn
 import schnetpack.properties as properties
 
-__all__ = ["Atomwise", "DipoleMoment", "Polarizability"]
+import copy
+
+__all__ = ["Atomwise", "LLPredRigidtyAtomwise", "DipoleMoment", "Polarizability"]
 
 
 class Atomwise(nn.Module):
@@ -87,6 +89,67 @@ class Atomwise(nn.Module):
         inputs[self.output_key] = y
         return inputs
 
+
+class LLPredRigidtyAtomwise(nn.Module):
+    """
+    Modified `Atomwise` class that implements the LLPR for uncertainty quantification.
+    """
+
+    def __init__(
+        self,
+        orig_model: Atomwise,
+        ll_feat_aggregation_mode: Optional[str] = None,
+        save_ll_feat_per_atom: bool = False,
+    ):
+        """
+        Args:
+            orig_model: original `Atomwise` model that this class wraps
+            ll_feat_aggregation_mode: one of sum, avg, or None, defaults to 
+                                      aggregation mode of original model
+            save_ll_feat_per_atom: option to save the ll feats per atom
+        """
+        super().__init__()
+
+        self.orig_model = orig_model
+        self.save_ll_feat_per_atom = save_ll_feat_per_atom
+
+        if ll_feat_aggregation_mode is None:
+            self.ll_feat_aggregation_mode = self.orig_model.aggregation_mode
+        else:
+            self.ll_feat_aggregation_mode = ll_feat_aggregation_mode
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # predict atomwise contributions
+        y = self.orig_model.outnet(inputs["scalar_representation"])
+
+        # extrac last layer features
+        ll_feats = self.orig_model.outnet[:-1](inputs["scalar_representation"])
+
+        # accumulate the per-atom output if necessary
+        if self.orig_model.per_atom_output_key is not None:
+            inputs[self.orig_model.per_atom_output_key] = y
+
+        # aggregate predictions
+        if self.orig_model.aggregation_mode is not None:
+            idx_m = inputs[properties.idx_m]
+            maxm = int(idx_m[-1]) + 1
+            y = snn.scatter_add(y, idx_m, dim_size=maxm)
+            y = torch.squeeze(y, -1)
+            if self.orig_model.aggregation_mode == "avg":
+                y = y / inputs[properties.n_atoms]
+
+        # aggregate ll feats
+        if self.ll_feat_aggregation_mode is not None:
+            idx_m = inputs[properties.idx_m]
+            maxm = int(idx_m[-1]) + 1
+            ll_feats = snn.scatter_add(ll_feats, idx_m, dim_size=maxm)
+            ll_feats = torch.squeeze(ll_feats, -1)
+            if self.ll_feat_aggregation_mode == "avg":
+                ll_feats = ll_feats / inputs[properties.n_atoms]
+
+        inputs[self.output_key] = y
+        inputs["ll_feats"] = ll_feats
+        return inputs
 
 class DipoleMoment(nn.Module):
     """
