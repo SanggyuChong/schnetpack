@@ -5,14 +5,15 @@ from typing import Dict, Optional, List
 from schnetpack.transform import Transform
 import schnetpack.properties as properties
 from schnetpack.utils import as_dtype
-from schnetpack.atomistic import Atomwise, LLPredRigidtyAtomwise, Forces #, LLPredRigidityForces
+from schnetpack.atomistic import Atomwise, LLPredRigidtyAtomwise, Forces, LLPredRigidityForces
+from schnetpack.data.loader import AtomsLoader
 
 import torch
 import torch.nn as nn
 
 import copy
 
-__all__ = ["AtomisticModel", "NeuralNetworkPotential"]
+__all__ = ["AtomisticModel", "NeuralNetworkPotential", "LLPredRigidityNNP"]
 
 
 class AtomisticModel(nn.Module):
@@ -194,7 +195,6 @@ class NeuralNetworkPotential(AtomisticModel):
 class LLPredRigidityNNP(AtomisticModel):
     """
     A wrapper class for neural network potential that implements LLPR uncertainties.
-
     """
 
     def __init__(
@@ -234,8 +234,8 @@ class LLPredRigidityNNP(AtomisticModel):
         for module in self.orig_model.output_modules:
             if isinstance(module, Atomwise):
                 if atomwise_detected:
-                    assert RuntimeError("LLPR is currently not compatible with "
-                                        "multiple `Atomwise` output modules!")
+                    assert RuntimeError("LLPR is currently not compatible with"
+                                        " multiple `Atomwise` output modules!")
                 mod_output_modules.append(
                     LLPredRigidtyAtomwise(
                         module,
@@ -247,10 +247,10 @@ class LLPredRigidityNNP(AtomisticModel):
                 atomwise_detected = True
             elif isinstance(module, Forces):
                 if forces_detected:
-                    assert RuntimeError("LLPR is currently not compatible with "
-                                        "multiple `Forces` output modules!")
-                # if self.consider_ll_feat_gradients:
-                #     mod_output_modules.append(LLPredRigidtyForces(module))
+                    assert RuntimeError("LLPR is currently not compatible with"
+                                        " multiple `Forces` output modules!")
+                if self.consider_ll_feat_gradients:
+                    mod_output_modules.append(LLPredRigidityForces(module))
                 else:
                     mod_output_modules.append(module)
                 forces_detected = True
@@ -287,13 +287,16 @@ class LLPredRigidityNNP(AtomisticModel):
         inputs = self.orig_model.postprocess(inputs)
         results = self.orig_model.extract_outputs(inputs)
 
-        results.append(inputs["ll_feats"])
+        results["ll_feats"] = inputs["ll_feats"]
+
+        if self.save_ll_feat_per_atom:
+            results["ll_feats_per_atom"] = inputs["ll_feats_per_atom"]
 
         if self.consider_ll_feat_gradients:
-            if "ll_feat_grad_F" in inputs:
-                results.append(inputs["ll_feat_grad_F"])
-            if "ll_feat_grad_S" in inputs:
-                results.append(inputs["ll_feat_grad_S"])
+            if "ll_feats_grad_F" in inputs:
+                results["ll_feats_grad_F"] = inputs["ll_feats_grad_F"]
+            if "ll_feats_grad_S" in inputs:
+                results["ll_feats_grad_S"] = inputs["ll_feats_grad_S"]
 
         if self.inv_covariance_computed:
             uncertainty = torch.einsum("ij, jk, ik -> i",
@@ -305,26 +308,45 @@ class LLPredRigidityNNP(AtomisticModel):
 
         return results
 
-    # def compute_covariance(self, dataset, weight_dict: List[float]) -> None:
-    #     # Utility function to compute the covariance matrix for a training set.
-    #     for cur_input in dataset:
+    def compute_covariance(self, dataloader: AtomsLoader, weights: Optional[Dict[str, float]]) -> None:
+        """
+        Utility function to compute the covariance matrix for a training set.
 
-    #         batch.to(self.covariance.device)
-    #         batch_dict = batch.to_dict()
+        Args:
+            dataloader: `AtomsLoader` object that contains the training set
+            weights: dictionary of weights that were used during model training.
+                     Must contain entries for:
+                     'E' (main target output),
+                     'F' (position gradient),
+                     'S' (cell/strain gradient).
+        """
+        for batch in dataloader:
+            results = self.forward(batch)
+            ll_feats = results["ll_feats"].detach()
+            self.covariance = self.covariance + ll_feats.T @ ll_feats
+            if "ll_feats_grad_F" in results:
+                ll_feats_grad_F = results["ll_feats_grad_F"].detach()
+                ll_feats_grad_F = ll_feats_grad_F.reshape(-1, ll_feats.shape[-1])
+                self.covariance = self.covariance + (ll_feats_grad_F.T @ ll_feats_grad_F) * weights['F'] / weights['E']
+            if "ll_feats_grad_S" in results:
+                ll_feats_grad_S = results["ll_feats_grad_S"].detach()
+                ll_feats_grad_F = ll_feats_grad_F.reshape(-1, ll_feats.shape[-1])
+                self.covariance = self.covariance + (ll_feats_grad_S.T @ ll_feats_grad_S) * weights['S'] / weights['E']
+        self.covariance_computed = True
 
-    #         output = self.forward(cur_input)
+    def compute_inv_covariance(self, C: float, sigma: float) -> None:
+        """
+        Utility function to compute the covariance matrix for a training set.
+        Refer to Bigi et al. for details on the calibration parameters.
 
-    #         ll_feats = output["ll_feats"].detach()
-    #         self.covariance = self.covariance + ll_feats.T @ ll_feats
-
-    #     self.covariance_computed = True
-
-    # def compute_inv_covariance(self, C: float, sigma: float) -> None:
-    #     # Utility function to set the hyperparameters of the uncertainty model.
-    #     if not self.covariance_computed:
-    #         raise RuntimeError("You must compute the covariance matrix before "
-    #                            "computing the inverse covariance matrix!")
-    #     self.inv_covariance = C * torch.linalg.inv(
-    #         self.covariance + sigma**2 * torch.eye(self.hidden_size_sum, device=self.covariance.device)
-    #         )
-    #     self.inv_covariance_computed = True
+        Args:
+            C: calibration parameter #1
+            sigma: calibration parameter #2
+        """
+        if not self.covariance_computed:
+            raise RuntimeError("You must compute the covariance matrix before "
+                               "computing the inverse covariance matrix!")
+        self.inv_covariance = C * torch.linalg.inv(
+            self.covariance + sigma**2 * torch.eye(self.ll_feat_dim, device=self.covariance.device)
+            )
+        self.inv_covariance_computed = True

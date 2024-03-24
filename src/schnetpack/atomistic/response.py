@@ -8,7 +8,7 @@ from torch.autograd import grad
 from schnetpack.nn.utils import derivative_from_molecular, derivative_from_atomic
 import schnetpack.properties as properties
 
-__all__ = ["Forces", "Strain", "Response"]
+__all__ = ["Forces", "LLPredRigidityForces", "Strain", "Response"]
 
 
 class ResponseException(Exception):
@@ -65,6 +65,7 @@ class Forces(nn.Module):
             [inputs[prop] for prop in self.required_derivatives],
             grad_outputs=go,
             create_graph=self.training,
+            allow_unused=True,  # added for stress computation
         )
 
         if self.calc_forces:
@@ -88,6 +89,108 @@ class Forces(nn.Module):
                 keepdim=True,
             )[:, :, None]
             inputs[self.stress_key] = stress / volume
+
+        return inputs
+
+
+class LLPredRigidityForces(nn.Module):
+    """
+    LLPR wrapper for the `Forces` module.
+
+    """
+
+    def __init__(
+        self,
+        orig_module: Forces,
+    ):
+        """
+        Args:
+            orig_module: If True, calculate atomic forces.
+            calc_stress: If True, calculate the stress tensor.
+            energy_key: Key of the energy in results.
+            force_key: Key of the forces in results.
+            stress_key: Key of the stress in results.
+        """
+        super().__init__()
+        self.orig_module = orig_module
+
+        self.model_outputs = []
+        if self.orig_module.calc_forces:
+            self.model_outputs.append(self.orig_module.force_key)
+        if self.orig_module.calc_stress:
+            self.model_outputs.append(self.orig_module.stress_key)
+
+        self.required_derivatives = []
+        if self.orig_module.calc_forces:
+            self.required_derivatives.append(properties.R)
+        if self.orig_module.calc_stress:
+            self.required_derivatives.append(properties.strain)
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+
+        # Get the actual gradients first
+        inputs = self.orig_module(inputs)
+
+        # Obtain ll feature gradients next
+        ll_feats = inputs["ll_feats"]
+
+        go: List[Optional[torch.Tensor]] = [torch.ones_like(ll_feats[:, 0])]  # allow sum across batch
+
+        if self.orig_module.calc_forces:
+            raw_f_grads = []
+            for i in range(ll_feats.shape[1]):
+                cur_grad = grad(
+                    [ll_feats[:, i]],
+                    [inputs[properties.R]],
+                    grad_outputs=go,
+                    create_graph=self.training,
+                    allow_unused=True,
+                )[0]
+                raw_f_grads.append(cur_grad)
+
+            f_grads = []
+            for cur_grad in raw_f_grads:
+                if cur_grad is None:
+                    f_grads.append(torch.zeros_like(inputs[properties.R]))
+                else:
+                    f_grads.append(cur_grad)
+
+            f_grads = torch.stack(f_grads)
+            f_grads = f_grads.permute(1, 2, 0)  # [num_atoms_batch, 3, num_ll_feats]
+
+            inputs["ll_feats_grad_F"] = -f_grads
+
+        if self.orig_module.calc_stress:
+
+            raw_s_grads = []
+            for i in range(ll_feats.shape[1]):
+                cur_grad = grad(
+                    [ll_feats[:, i]],
+                    [inputs[properties.strain]],
+                    grad_outputs=go,
+                    create_graph=self.training,
+                    allow_unused=True,
+                )[0]
+                raw_s_grads.append(cur_grad)
+
+            s_grads = []
+            for cur_grad in raw_s_grads:
+                if cur_grad is None:
+                    s_grads.append(torch.zeros_like(inputs[properties.cell]))
+                else:
+                    s_grads.append(cur_grad)
+
+            s_grads = torch.stack(s_grads)
+            s_grads = s_grads.permute(1, 2, 3, 0)  # [num_batch, 3, 3, num_ll_feats]    
+
+            cell = inputs[properties.cell]
+            volume = torch.sum(
+                cell[:, 0, :] * torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
+                dim=1,
+                keepdim=True,
+            )[:, :, None]
+
+            inputs["ll_feats_grad_S"] = s_grads / volume.unsqueeze(-1)  # unsqueeze one more
 
         return inputs
 

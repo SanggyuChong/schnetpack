@@ -149,7 +149,7 @@ class LLPredRigidtyAtomwise(nn.Module):
             ll_feats = snn.scatter_add(ll_feats, idx_m, dim_size=maxm)
             ll_feats = torch.squeeze(ll_feats, -1)
             if self.ll_feat_aggregation_mode == "avg":
-                ll_feats = ll_feats / inputs[properties.n_atoms]
+                ll_feats = torch.div(ll_feats, inputs[properties.n_atoms].unsqueeze(-1))
 
         inputs[self.orig_model.output_key] = y
         inputs["ll_feats"] = ll_feats
